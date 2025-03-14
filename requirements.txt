@@ -3,3 +3,4 @@ open3d
 opencv-python
 pyrealsense2
 pandas
+cv2
