@@ -9,7 +9,7 @@ requirements.txt     # Dependências do projeto
 ```
 
 ## 🛠 Tecnologias Utilizadas
-- **Python** (3.8+)
+- **Python** (3.7)
 - **Intel RealSense SDK 2.0**
 - **Open3D**
 - **NumPy**
