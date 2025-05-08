@@ -10,7 +10,7 @@ requirements.txt     # Dependências do projeto
 
 ## 🛠 Tecnologias Utilizadas
 - **Python** (3.7)
-- **Intel RealSense SDK 2.0**
+- **Intel RealSense SDK 2.0** (https://github.com/IntelRealSense/librealsense/releases/tag/v2.54.2)
 - **Open3D**
 - **NumPy**
 - **OpenCV**
