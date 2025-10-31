@@ -78,13 +78,12 @@ O fluxo oficial está concentrado em `src/main.py`. Os demais arquivos no diret�
 
 1. **Hardware**
    - Intel RealSense D456 (ou compatível com SDK 2.0).
-   - PC com GPU opcional (YOLOv8 usa CUDA se disponível, mas roda em CPU).
 
 2. **Software**
    - Python 3.10 ou superior recomendado.
    - [Intel RealSense SDK 2.0](https://github.com/IntelRealSense/librealsense) instalado com suporte à câmera (Linux: `apt`, Windows: instalador oficial).
    - Compilação do módulo `pyrealsense2` compatível com a versão do SDK e do Python (já listado em `requirements.txt`).
-   - Drivers CUDA/cuDNN (opcional) para acelerar o YOLOv8.
+   pip install -r requirements.txt
 
 3. **Sistema Operacional**
    - Linux (Ubuntu 20.04+ testado).
@@ -95,12 +94,12 @@ O fluxo oficial está concentrado em `src/main.py`. Os demais arquivos no diret�
 
 1. **Clonar o repositório**
    ```bash
-   git clone https://github.com/<seu_usuario>/<seu_repositorio>.git
+   git clone https://github.com/kevinadolf/ic-computer-vision.git
    cd <seu_repositorio>
    ```
 
 2. **Criar ambiente virtual (opcional, recomendado); instrução para Linux**
-   ```bash
+   ```
    python -m venv .venv
    source .venv/bin/activate
    ```
