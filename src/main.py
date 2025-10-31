@@ -1,358 +1,375 @@
-import pyrealsense2 as rs
+import math
+import copy
 import numpy as np
 import cv2
 import open3d as o3d
+import pyrealsense2 as rs
 from ultralytics import YOLO
-from scipy.spatial.transform import Rotation as ScipyRotation
-import copy
 
-# --- modulo 1: interface da camera ---
+
 class RealSenseCamera:
-    """
-    essa classe cuida de tudo relacionado a camera intel realsense.
-    """
+    """Interface com a Intel RealSense D456."""
+
     def __init__(self, width=1280, height=720, fps=30):
         print("inicializando a camera realsense...")
         self.width = width
         self.height = height
         self.fps = fps
+
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-
-        self.config.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-        self.config.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
+        self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
         self.profile = self.pipeline.start(self.config)
-        
-        # pega o fator de escala para a profundidade
         self.depth_scale = self.profile.get_device().first_depth_sensor().get_depth_scale()
 
-        # o alinhamento e super importante para garantir que a imagem de cor e a de profundidade coincidam
-        align_to = rs.stream.color
-        self.align = rs.align(align_to)
-        
+        self.align = rs.align(rs.stream.color)
         self.intrinsics = self._get_o3d_intrinsics()
         print("camera realsense inicializada com sucesso.")
 
     def _get_o3d_intrinsics(self):
-        """pega os parametros intrinsecos da camera e converte para o formato do open3d."""
         video_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = video_profile.get_intrinsics()
         return o3d.camera.PinholeCameraIntrinsic(
-            width=intr.width, height=intr.height, fx=intr.fx, fy=intr.fy, cx=intr.cx, cy=intr.cy
+            width=intr.width,
+            height=intr.height,
+            fx=intr.fx,
+            fy=intr.fy,
+            cx=intr.cx,
+            cy=intr.cy,
         )
 
     def get_frames(self):
-        """espera por um novo conjunto de imagens (cor e profundidade) e retorna elas."""
         try:
             frames = self.pipeline.wait_for_frames(timeout_ms=5000)
-            aligned_frames = self.align.process(frames)
-            
-            depth_frame = aligned_frames.get_depth_frame()
-            color_frame = aligned_frames.get_color_frame()
-            
+            aligned = self.align.process(frames)
+
+            depth_frame = aligned.get_depth_frame()
+            color_frame = aligned.get_color_frame()
+
             if not depth_frame or not color_frame:
                 print("aviso: quadro de profundidade ou cor nao encontrado.")
                 return None, None
-                
+
             depth_image = np.asanyarray(depth_frame.get_data())
             color_image = np.asanyarray(color_frame.get_data())
-            
             return depth_image, color_image
-        except RuntimeError as e:
-            print(f"erro ao obter quadros: {e}")
+        except RuntimeError as exc:
+            print(f"erro ao obter quadros: {exc}")
             return None, None
 
     def stop(self):
-        """para a camera."""
         print("parando o pipeline da camera.")
         self.pipeline.stop()
 
-# --- modulo 2: detecçao de objetos ---
+
 class ObjectDetector:
-    """
-    essa classe usa o yolo para encontrar objetos na imagem.
-    """
-    def __init__(self, model_path='yolov8n.pt'):
-        print(f"carregando o modelo yolo do caminho: {model_path}")
+    """Deteccao 2D baseada em YOLOv8."""
+
+    def __init__(self, model_path="yolov8n.pt", confidence_threshold=0.5):
+        print(f"carregando o modelo yolo: {model_path}")
         self.model = YOLO(model_path)
+        self.confidence_threshold = confidence_threshold
         print("modelo yolo carregado com sucesso.")
 
-    def detect(self, image, confidence_threshold=0.5):
-        """detecta objetos em uma imagem e retorna uma lista com o que encontrou."""
+    def detect(self, image):
         results = self.model(image, verbose=False)
-        detections =
+        detections = []
+
         for result in results:
             for box in result.boxes:
-                if box.conf > confidence_threshold:
-                    x1, y1, x2, y2 = box.xyxy.cpu().numpy()
-                    class_id = int(box.cls)
-                    class_name = self.model.names[class_id]
-                    detections.append({
-                        'class_name': class_name,
-                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                        'confidence': float(box.conf)
-                    })
+                if box.conf < self.confidence_threshold:
+                    continue
+                x1, y1, x2, y2 = box.xyxy.cpu().numpy()
+                class_id = int(box.cls)
+                detections.append(
+                    {
+                        "class_name": self.model.names[class_id],
+                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "confidence": float(box.conf),
+                    }
+                )
         return detections
 
-# --- modulo 3: funçoes do pipeline de pose ---
+
+class ShapeAnalyzer:
+    """Analisa a nuvem segmentada e classifica em primitivas geometricas."""
+
+    def __init__(self, sphere_tol=0.12, base_tol=0.18, diff_tol=0.25):
+        self.sphere_tol = sphere_tol
+        self.base_tol = base_tol
+        self.diff_tol = diff_tol
+
+    def analyze(self, object_pcd):
+        if len(object_pcd.points) == 0:
+            return None
+
+        obb = object_pcd.get_oriented_bounding_box()
+        extent = np.asarray(obb.extent, dtype=float)
+
+        if np.any(extent <= 0):
+            return None
+
+        shape = self._classify(extent)
+        pose = np.eye(4)
+        pose[:3, :3] = obb.R
+        pose[:3, 3] = obb.center
+
+        return {
+            "shape": shape,
+            "pose": pose,
+            "dimensions": extent,
+            "obb": obb,
+        }
+
+    def _classify(self, dims):
+        dims = np.asarray(dims, dtype=float)
+        mean_dim = dims.mean()
+        rel_diff = np.abs(dims - mean_dim) / max(mean_dim, 1e-6)
+
+        if np.all(rel_diff < self.sphere_tol):
+            return "sphere"
+
+        idx_sorted = np.argsort(dims)
+        small1, small2, large = dims[idx_sorted]
+        base_similarity = abs(small1 - small2) / max(small2, 1e-6)
+        height_difference = abs(large - ((small1 + small2) * 0.5)) / max(large, 1e-6)
+
+        if base_similarity < self.base_tol and height_difference > self.diff_tol:
+            return "cylinder"
+
+        distinct_diffs = np.abs(np.diff(np.sort(dims))) / np.maximum(np.sort(dims)[1:], 1e-6)
+        if np.all(distinct_diffs > self.base_tol):
+            return "box"
+
+        return "block"
+
+
 class PoseEstimationPipeline:
-    """
-    aqui a magica acontece. essa classe junta tudo para estimar a pose 6d.
-    """
-    def __init__(self, model_paths, voxel_size=0.005):
+    """Pipeline coarse-to-fine convertido para abordagem model-free."""
+
+    def __init__(self, voxel_size=0.01, min_points=300, max_depth=5.0):
         self.camera = RealSenseCamera()
         self.detector = ObjectDetector()
-        self.intrinsics = self.camera.intrinsics
+        self.shape_analyzer = ShapeAnalyzer()
         self.voxel_size = voxel_size
-        
-        print("carregando e pre-processando modelos 3d...")
-        self.models = self._load_models(model_paths)
-        print("modelos 3d carregados.")
-
-    def _load_models(self, model_paths):
-        """carrega os modelos 3d (cad) dos objetos que queremos encontrar."""
-        models = {}
-        for class_name, path in model_paths.items():
-            print(f"  - carregando '{class_name}' de '{path}'")
-            try:
-                model_mesh = o3d.io.read_triangle_mesh(path)
-                model_mesh.compute_vertex_normals()
-            except Exception as e:
-                print(f"erro ao carregar o modelo {path}: {e}")
-                continue
-
-            # e bom amostrar a malha para ter uma nuvem de pontos uniforme
-            model_pcd = model_mesh.sample_points_poisson_disk(number_of_points=5000)
-            model_pcd_down = model_pcd.voxel_down_sample(self.voxel_size)
-            model_pcd_down.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 2, max_nn=30))
-            
-            model_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                model_pcd_down,
-                o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 5, max_nn=100))
-            
-            models[class_name] = {'pcd': model_pcd_down, 'fpfh': model_fpfh, 'full_pcd': model_pcd}
-        return models
+        self.min_points = min_points
+        self.max_depth = max_depth
+        self.intrinsics = self.camera.intrinsics
 
     def run_single_frame(self):
-        """executa uma unica vez o pipeline completo."""
         depth_image, color_image = self.camera.get_frames()
         if depth_image is None or color_image is None:
-            return None, None
+            return [], None
 
-        # 1. cria a nuvem de pontos da cena inteira
-        scene_pcd = self._create_point_cloud_from_frames(depth_image, color_image)
-        scene_pcd_down = scene_pcd.voxel_down_sample(self.voxel_size)
-        scene_pcd_down.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 2, max_nn=30))
-
-        # 2. detecta os objetos na imagem 2d
+        scene_pcd = self._create_point_cloud(depth_image, color_image)
         detections = self.detector.detect(color_image)
-        
-        estimated_poses =
-        
+
+        objects = []
         for det in detections:
-            class_name = det['class_name']
-            if class_name not in self.models:
+            object_pcd = self._segment_object(scene_pcd, det["bbox"])
+            if object_pcd is None or len(object_pcd.points) < self.min_points:
                 continue
 
-            print(f"\nprocessando objeto detectado: {class_name}")
+            denoised = object_pcd.voxel_down_sample(self.voxel_size)
+            if len(denoised.points) >= self.min_points // 2:
+                object_pcd = denoised
 
-            # 3. recorta o objeto da nuvem de pontos da cena
-            object_pcd = self._segment_object_from_bbox(scene_pcd, det['bbox'])
-            if object_pcd is None or len(object_pcd.points) < 100:
-                print(f"  - segmentacao falhou ou objeto muito pequeno. pulando.")
+            analysis = self.shape_analyzer.analyze(object_pcd)
+            if analysis is None:
                 continue
 
-            object_pcd_down = object_pcd.voxel_down_sample(self.voxel_size)
-            object_pcd_down.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 2, max_nn=30))
-
-            # 4. registro global (uma primeira aproximacao da pose)
-            print("  - executando registro global (ransac)...")
-            model = self.models[class_name]
-            object_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                object_pcd_down,
-                o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 5, max_nn=100))
-            
-            coarse_transform = self._execute_global_registration(
-                object_pcd_down, model['pcd'], object_fpfh, model['fpfh']
+            color = self._average_color(object_pcd)
+            objects.append(
+                {
+                    "class_name": det["class_name"],
+                    "confidence": det["confidence"],
+                    "shape": analysis["shape"],
+                    "pose": analysis["pose"],
+                    "dimensions": analysis["dimensions"],
+                    "color": color,
+                    "point_cloud": object_pcd,
+                }
             )
+        return objects, scene_pcd
 
-            # 5. registro local (refinamento da pose com icp)
-            print("  - executando registro local (icp)...")
-            result = self._refine_registration(
-                model['full_pcd'], object_pcd, coarse_transform
-            )
-            
-            print(f"  - fitness do icp: {result.fitness:.3f}, rmse: {result.inlier_rmse:.4f}")
-
-            # 6. valida o resultado e guarda se for bom
-            if result.fitness > 0.6 and result.inlier_rmse < self.voxel_size:
-                print("  - pose estimada com sucesso!")
-                estimated_poses.append({
-                    'class_name': class_name,
-                    'pose': result.transformation,
-                    'fitness': result.fitness,
-                    'rmse': result.inlier_rmse
-                })
-            else:
-                print("  - a pose estimada nao parece boa o suficiente.")
-
-        return estimated_poses, scene_pcd
-
-    def _create_point_cloud_from_frames(self, depth_image, color_image):
-        """cria uma nuvem de pontos open3d a partir das imagens de profundidade e cor."""
+    def _create_point_cloud(self, depth_image, color_image):
         depth_o3d = o3d.geometry.Image(depth_image)
         color_o3d = o3d.geometry.Image(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-        
+
         rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color_o3d, depth_o3d, depth_scale=self.camera.depth_scale, depth_trunc=3.0, convert_rgb_to_intensity=False
+            color_o3d,
+            depth_o3d,
+            depth_scale=self.camera.depth_scale,
+            depth_trunc=self.max_depth,
+            convert_rgb_to_intensity=False,
         )
-        
+
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, self.intrinsics)
-        # a nuvem de pontos vem virada, entao a gente desvira ela
-        pcd.transform([,
-                       [0, -1, 0, 0],
-                       [0, 0, -1, 0],
-                       ])
+        pcd.transform(
+            [
+                [1, 0, 0, 0],
+                [0, -1, 0, 0],
+                [0, 0, -1, 0],
+                [0, 0, 0, 1],
+            ]
+        )
         return pcd
 
-    def _segment_object_from_bbox(self, scene_pcd, bbox):
-        """recorta a nuvem de pontos do objeto usando a caixa de deteccao 2d."""
+    def _segment_object(self, scene_pcd, bbox):
         x1, y1, x2, y2 = bbox
-        
-        # cria um poligono 2d a partir da caixa de deteccao
-        bounding_polygon = np.array([x1, y1, 0],
-            [x2, y1, 0],
-            [x2, y2, 0],
-            [x1, y2, 0]).astype("float64")
+        x1 = int(np.clip(x1, 0, self.camera.width - 1))
+        y1 = int(np.clip(y1, 0, self.camera.height - 1))
+        x2 = int(np.clip(x2, 0, self.camera.width - 1))
+        y2 = int(np.clip(y2, 0, self.camera.height - 1))
 
-        # transforma o poligono 2d num volume 3d para recortar a nuvem de pontos
-        vol = o3d.visualization.SelectionPolygonVolume()
-        vol.orthogonal_axis = "Z"
-        vol.axis_max = 5.0 # profundidade maxima do recorte
-        vol.axis_min = 0.1 # profundidade minima do recorte
-        vol.bounding_polygon = o3d.utility.Vector3dVector(bounding_polygon)
-        
-        object_pcd = vol.crop_point_cloud(scene_pcd)
-        return object_pcd
+        if x2 <= x1 or y2 <= y1:
+            return None
 
-    def _execute_global_registration(self, source_down, target_down, source_fpfh, target_fpfh):
-        """executa o registro global com ransac."""
-        distance_threshold = self.voxel_size * 1.5
-        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-            source_down, target_down, source_fpfh, target_fpfh, True,
-            distance_threshold,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-            3,, o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
-        return result.transformation
+        polygon = np.array(
+            [
+                [x1, y1, 0.0],
+                [x2, y1, 0.0],
+                [x2, y2, 0.0],
+                [x1, y2, 0.0],
+            ],
+            dtype=np.float64,
+        )
 
-    def _refine_registration(self, source, target, initial_transform):
-        """refina a pose com o icp ponto-a-plano."""
-        threshold = self.voxel_size * 0.4
-        reg_p2p = o3d.pipelines.registration.registration_icp(
-            source, target, threshold, initial_transform,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200))
-        return reg_p2p
+        volume = o3d.visualization.SelectionPolygonVolume()
+        volume.orthogonal_axis = "Z"
+        volume.axis_max = self.max_depth
+        volume.axis_min = 0.05
+        volume.bounding_polygon = o3d.utility.Vector3dVector(polygon)
+
+        cropped = volume.crop_point_cloud(scene_pcd)
+        return cropped
+
+    def _average_color(self, object_pcd):
+        colors = np.asarray(object_pcd.colors)
+        if colors.size == 0:
+            return np.array([0.8, 0.8, 0.8])
+        return np.clip(colors.mean(axis=0), 0.0, 1.0)
 
     def stop(self):
-        """para a camera."""
         self.camera.stop()
 
-# --- modulo 4: visualizacao e utilitarios ---
-def visualize_poses(scene_pcd, poses, models):
-    """mostra a nuvem de pontos da cena com os modelos 3d alinhados."""
-    if scene_pcd is None:
-        return
-        
-    geometries = [scene_pcd]
-    
-    # cria um sistema de coordenadas para ter uma referencia
-    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=)
-    geometries.append(coord_frame)
-    
-    for pose_info in poses:
-        class_name = pose_info['class_name']
-        transform = pose_info['pose']
-        
-        model_pcd = models[class_name]['full_pcd']
-        model_copy = copy.deepcopy(model_pcd)
-        model_copy.transform(transform)
-        
-        # pinta o modelo de uma cor diferente para destacar
-        model_copy.paint_uniform_color([1.0, 0.706, 0]) # laranja
-        geometries.append(model_copy)
-        
-        # adiciona um sistema de coordenadas para a pose do objeto
-        obj_coord_frame = copy.deepcopy(coord_frame).transform(transform)
-        geometries.append(obj_coord_frame)
-        
-    o3d.visualization.draw_geometries(geometries)
 
-# --- ponto de entrada principal ---
+class DigitalTwinVisualizer:
+    """Renderizacao nao bloqueante do gemeo digital."""
+
+    def __init__(self, window_name="Digital Twin", width=1280, height=720):
+        self.vis = o3d.visualization.Visualizer()
+        self.vis.create_window(window_name=window_name, width=width, height=height)
+        self.first_frame = True
+        self.coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+        self.current_geometries = []
+
+    def update(self, scene_pcd, objects):
+        if scene_pcd is None:
+            return
+
+        self.vis.clear_geometries()
+        self.current_geometries = []
+
+        scene_copy = copy.deepcopy(scene_pcd)
+        self.current_geometries.append(scene_copy)
+        self.vis.add_geometry(scene_copy, reset_bounding_box=self.first_frame)
+
+        coord_copy = copy.deepcopy(self.coordinate_frame)
+        self.current_geometries.append(coord_copy)
+        self.vis.add_geometry(coord_copy)
+
+        for obj in objects:
+            mesh = self._create_mesh(obj)
+            if mesh is None:
+                continue
+            self.current_geometries.append(mesh)
+            self.vis.add_geometry(mesh)
+
+        self.vis.poll_events()
+        self.vis.update_renderer()
+        self.first_frame = False
+
+    def _create_mesh(self, obj_info):
+        shape = obj_info["shape"]
+        dims = obj_info["dimensions"]
+        pose = obj_info["pose"]
+        color = obj_info["color"]
+
+        if pose is None or dims is None:
+            return None
+
+        if shape == "sphere":
+            radius = float(np.mean(dims) * 0.5)
+            mesh = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        elif shape == "cylinder":
+            mesh = self._build_cylinder_mesh(dims)
+        elif shape == "box":
+            mesh = self._build_box_mesh(dims)
+        else:
+            mesh = self._build_box_mesh(dims)
+
+        mesh.paint_uniform_color(color.tolist())
+        mesh.compute_vertex_normals()
+        mesh.transform(pose)
+        return mesh
+
+    def _build_box_mesh(self, dims):
+        width, height, depth = dims
+        mesh = o3d.geometry.TriangleMesh.create_box(width, height, depth)
+        mesh.translate([-width * 0.5, -height * 0.5, -depth * 0.5])
+        return mesh
+
+    def _build_cylinder_mesh(self, dims):
+        idx_sorted = np.argsort(dims)
+        small1, small2, large = dims[idx_sorted]
+        height_axis = idx_sorted[-1]
+        radius = float((small1 + small2) * 0.25)
+        height = float(large)
+
+        mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=radius, height=height)
+        mesh.translate([0.0, 0.0, -height * 0.5])
+
+        if height_axis == 0:
+            rot = o3d.geometry.get_rotation_matrix_from_xyz([0.0, math.pi / 2.0, 0.0])
+            mesh.rotate(rot, center=(0.0, 0.0, 0.0))
+        elif height_axis == 1:
+            rot = o3d.geometry.get_rotation_matrix_from_xyz([-math.pi / 2.0, 0.0, 0.0])
+            mesh.rotate(rot, center=(0.0, 0.0, 0.0))
+        return mesh
+
+    def close(self):
+        self.vis.destroy_window()
+
+
 if __name__ == "__main__":
-    
-    # #####################################################################
-    # # IMPORTANTE: AQUI E ONDE VOCE DEVE COLOCAR OS SEUS ARQUIVOS CAD     #
-    # #####################################################################
-    #
-    # o dicionario 'model_paths' mapeia o nome da classe que o yolo detecta
-    # para o caminho do arquivo do modelo 3d (.ply,.stl,.obj, etc.).
-    #
-    # exemplo: se o seu yolo foi treinado para detectar 'garrafa', a chave deve ser 'garrafa'
-    # e o valor deve ser o caminho para o arquivo 'garrafa.ply'.
-    
-    model_paths = {
-        'cup': './models/cup_model.ply',
-        'bottle': './models/bottle_model.ply'
-        # adicione mais objetos aqui. por exemplo:
-        # 'meu_objeto': './caminho/para/meu_objeto.stl'
-    }
-    
-    # o codigo abaixo verifica se os modelos existem.
-    # se nao existirem, ele cria uns cilindros ficticios para o codigo nao quebrar.
-    # voce deve substituir esses cilindros pelos seus modelos reais.
-    import os
-    if not os.path.exists('./models'):
-        os.makedirs('./models')
-    if 'cup' in model_paths and not os.path.exists(model_paths['cup']):
-        print("aviso: modelo de 'cup' nao encontrado. criando um cilindro ficticio.")
-        cup_mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.03, height=0.08)
-        cup_mesh.compute_vertex_normals()
-        o3d.io.write_triangle_mesh(model_paths['cup'], cup_mesh)
-    if 'bottle' in model_paths and not os.path.exists(model_paths['bottle']):
-        print("aviso: modelo de 'bottle' nao encontrado. criando um cilindro ficticio.")
-        bottle_mesh = o3d.geometry.TriangleMesh.create_cylinder(radius=0.04, height=0.2)
-        bottle_mesh.compute_vertex_normals()
-        o3d.io.write_triangle_mesh(model_paths['bottle'], bottle_mesh)
+    pipeline = PoseEstimationPipeline(voxel_size=0.01)
+    visualizer = DigitalTwinVisualizer()
 
-
-    pipeline = PoseEstimationPipeline(model_paths, voxel_size=0.005)
-    
     try:
         while True:
-            print("\n--- pressione 'enter' para capturar e processar um novo quadro (ou 'q' para sair) ---")
-            if input() == 'q':
-                break
-                
-            poses, scene = pipeline.run_single_frame()
-            
-            if poses:
-                print(f"\nposes estimadas encontradas: {len(poses)}")
-                for p in poses:
-                    print(f"  - classe: {p['class_name']}, fitness: {p['fitness']:.2f}, rmse: {p['rmse']:.4f}")
-                
-                visualize_poses(scene, poses, pipeline.models)
+            objects, scene = pipeline.run_single_frame()
+
+            if objects:
+                print(f"objetos detectados: {len(objects)}")
+                for obj in objects:
+                    pose = obj["pose"]
+                    center = pose[:3, 3] if pose is not None else np.zeros(3)
+                    dims = obj["dimensions"]
+                    print(
+                        f"  - classe: {obj['class_name']} | forma: {obj['shape']} | "
+                        f"dimensoes: {np.round(dims, 3)} | centro: {np.round(center, 3)} | "
+                        f"conf: {obj['confidence']:.2f}"
+                    )
             else:
-                print("\nnenhuma pose confiavel foi estimada neste quadro.")
-                if scene is not None:
-                    print("mostrando apenas a nuvem de pontos da cena.")
-                    o3d.visualization.draw_geometries([scene])
+                print("nenhum objeto com geometria consistente detectado neste quadro.")
+
+            visualizer.update(scene, objects)
 
     except KeyboardInterrupt:
         print("interrupcao do usuario. encerrando.")
     finally:
+        visualizer.close()
         pipeline.stop()
